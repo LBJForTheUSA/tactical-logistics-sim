@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Operational Logistics Combat Simulation</title>
+  <style>
+    :root {
+      --bg: #071017;
+      --panel: rgba(11, 18, 25, 0.82);
+      --line: rgba(142, 178, 214, 0.28);
+      --hud: #dfeefb;
+      --accent: #6eccff;
+      --warning: #ff8f7a;
+      --ok: #8add7b;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--hud);
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: radial-gradient(circle at center, #122534 0%, #060d15 42%, #02070a 100%);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <script>
+  (() => {
+    'use strict';
+
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    const WORLD_SEED = 0x5EEDBEEF >>> 0;
+    const TERRAIN_TAGS = [
+      'forest', 'ridge', 'river', 'meadow', 'urban', 'quarry', 'wetland',
+      'plains', 'floodplain', 'factoryzone', 'fortified', 'scrub', 'dry'
+    ];
+
+    const GEOGRAPHIC_PAYLOAD = new Float32Array(1_310_720);
+    const RNG = (() => {
+      let s = WORLD_SEED;
+      return () => {
+        s = (s + 0x6D2B79F5) >>> 0;
+        let t = Math.imul(s ^ (s >>> 15), s | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    })();
+
+    for (let i = 0; i < GEOGRAPHIC_PAYLOAD.length; i++) {
+      GEOGRAPHIC_PAYLOAD[i] = (RNG() * 65535) + ((i % 257) * 0.6875);
+    }
+
+    const state = {
+      width: 0,
+      height: 0,
+      dpr: Math.max(1, window.devicePixelRatio || 1),
+      world: null,
+      player: null,
+      keys: Object.create(null),
+      mouse: { x: 0, y: 0, down: false },
+      commandMap: false,
+      view: { x: 0, y: 0, zoom: 1.12, cullPad: 260 },
+      tacticalAccumulator: 0,
+      strategicAccumulator: 0,
+      tacticalRate: 1 / 60,
+      strategicRate: 1,
+      lastTs: 0,
+      bullets: [],
+      impacts: []
+    };
+
+    function clamp(v, min, max) {
+      return Math.min(Math.max(v, min), max);
+    }
+
+    function normalizeAngle(a) {
+      while (a > Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    }
+
+    function worldToScreen(x, y) {
+      return {
+        x: (x - state.view.x) * state.view.zoom + state.width * 0.5,
+        y: (y - state.view.y) * state.view.zoom + state.height * 0.5
+      };
+    }
+
+    function isVisibleWorld(x, y) {
+      const sx = (x - state.view.x) * state.view.zoom + state.width * 0.5;
+      const sy = (y - state.view.y) * state.view.zoom + state.height * 0.5;
+      return sx > -state.view.cullPad && sx < state.width + state.view.cullPad &&
+             sy > -state.view.cullPad && sy < state.height + state.view.cullPad;
+    }
+
+    function setupInput() {
+      addEventListener('keydown', (ev) => {
+        state.keys[ev.code] = true;
+        if (ev.code === 'KeyM') {
+          state.commandMap = !state.commandMap;
+        }
+        if (ev.code === 'KeyR') {
+          state.player.ammo = 42;
+          state.player.health = 100;
+          state.player.bloom = 0.08;
+        }
+      });
+
+      addEventListener('keyup', (ev) => {
+        state.keys[ev.code] = false;
+      });
+
+      canvas.addEventListener('mousemove', (ev) => {
+        const rect = canvas.getBoundingClientRect();
+        state.mouse.x = ev.clientX - rect.left;
+        state.mouse.y = ev.clientY - rect.top;
+      });
+
+      canvas.addEventListener('mousedown', () => {
+        state.mouse.down = true;
+      });
+
+      window.addEventListener('mouseup', () => {
+        state.mouse.down = false;
+      });
+    }
+
+    function resize() {
+      state.width = window.innerWidth;
+      state.height = window.innerHeight;
+      state.dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.floor(state.width * state.dpr);
+      canvas.height = Math.floor(state.height * state.dpr);
+      canvas.style.width = state.width + 'px';
+      canvas.style.height = state.height + 'px';
+      ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+    }
+
+    function generateFallbackData() {
+      const nodes = [];
+      for (let i = 0; i < 8000; i++) {
+        const angle = (i * 0.61803398875 + 0.42) % (Math.PI * 2);
+        const radius = 80 + Math.sqrt(i) * 14 + ((i * 7.1) % 200);
+        const x = Math.cos(angle) * radius + ((i * 13) % 1700) - 850;
+        const y = Math.sin(angle) * radius * 0.82 + ((i * 19) % 1200) - 600;
+        const tag = TERRAIN_TAGS[i % TERRAIN_TAGS.length];
+        nodes.push({
+          id: i,
+          x, y,
+          tag,
+          faction: ['A', 'B', 'C', 'D', 'Neutral'][i % 5],
+          elevation: ((Math.sin(x * 0.045) + Math.cos(y * 0.05)) * 80) + (i % 11) * 2.5,
+          fertility: ((i * 7) % 100) + 20,
+          roads: [],
+          supply: 70 + (i % 30),
+          fortification: 4 + (i % 35),
+          passable: true
+        });
+      }
+      return nodes;
+    }
+
+    function buildWorld() {
+      const validation = {
+        fallbackUsed: false,
+        errors: [],
+        generatedAt: Date.now()
+      };
+
+      try {
+        const nodes = [];
+        const rand = (() => {
+          let s = 1337 + (GEOGRAPHIC_PAYLOAD[57] * 311.0 >>> 0);
+          return () => {
+            s = (s * 1664525 + 1013904223) >>> 0;
+            return s / 4294967296;
+          };
+        })();
+
+        for (let i = 0; i < 8000; i++) {
+          const base = i * 2.5;
+          const angle = (base * 0.78539816339 + 0.371) % (Math.PI * 2);
+          const ring = 90 + Math.sqrt(i) * 12 + (GEOGRAPHIC_PAYLOAD[i % GEOGRAPHIC_PAYLOAD.length] % 240);
+          const x = Math.cos(angle) * ring + (rand() * 1600 - 800);
+          const y = Math.sin(angle) * ring * 0.82 + (rand() * 1200 - 600);
+          const tag = TERRAIN_TAGS[(i + Math.floor((x + y) * 0.17)) % TERRAIN_TAGS.length];
+
+          const node = {
+            id: i,
+            x,
+            y,
+            tag,
+            elevation: (Math.sin(x * 0.03) + Math.cos(y * 0.04) + rand()) * 110,
+            fertility: clamp((rand() * 100) + 10, 0, 100),
+            faction: ['A', 'B', 'C', 'D', 'Neutral'][i % 5],
+            supply: 80 + rand() * 120,
+            fortification: 5 + rand() * 40,
+            roads: [],
+            passable: true
+          };
+          nodes.push(node);
+        }
+
+        const roads = [];
+        for (let i = 0; i < nodes.length; i++) {
+          const node = nodes[i];
+          const roadLimit = 6;
+          const seen = new Set();
+          for (let j = 0; j < 18; j++) {
+            const neighborIndex = ((i + 1 + j * 13 + Math.floor(node.x * 0.1 + node.y * 0.15)) % nodes.length);
+            if (neighborIndex === i) continue;
+            const other = nodes[neighborIndex];
+            if (!other) continue;
+            const dist = Math.hypot(node.x - other.x, node.y - other.y);
+            if (dist < 260 && !seen.has(other.id)) {
+              seen.add(other.id);
+              node.roads.push(other.id);
+              other.roads.push(node.id);
+              if (node.roads.length >= roadLimit) break;
+            }
+          }
+          if (node.roads.length > 0) {
+            roads.push({ a: node.id, b: node.roads.slice(0, 4) });
+          }
+        }
+
+        const hubs = [];
+        const hubTypes = ['factory', 'depot', 'fob', 'refinery', 'airfield', 'port'];
+        for (let i = 0; i < 50; i++) {
+          const anchor = nodes[(i * 149 + 31) % nodes.length];
+          const type = hubTypes[i % hubTypes.length];
+          const hub = {
+            id: `hub-${i}`,
+            index: i,
+            type,
+            x: anchor.x + ((i % 7) - 3) * 18,
+            y: anchor.y + ((i % 9) - 4) * 22,
+            hp: 100 + (i % 8) * 18,
+            faction: ['A', 'B', 'C', 'D'][i % 4],
+            inventory: {
+              iron: 70 + (i % 9) * 12,
+              fuel: 50 + (i % 11) * 8,
+              ammo: 64 + (i % 8) * 14,
+              food: 55 + (i % 6) * 9,
+              parts: 40 + (i % 5) * 7,
+              supply: 90 + (i % 10) * 5
+            },
+            production: {
+              iron: 4 + (i % 5),
+              fuel: 3 + (i % 4),
+              ammo: 3 + (i % 6),
+              food: 4 + (i % 5),
+              parts: 2 + (i % 4)
+            },
+            logistics: [],
+            staticDefenses: [],
+            targetLocks: [],
+            passable: true
+          };
+          hubs.push(hub);
+        }
+
+        for (let i = 0; i < hubs.length; i++) {
+          const hub = hubs[i];
+          for (let j = 0; j < 6; j++) {
+            const target = hubs[(i + 1 + j * 7 + (j % 3)) % hubs.length];
+            if (!target || target.id === hub.id) continue;
+            const dist = Math.hypot(hub.x - target.x, hub.y - target.y);
+            hub.logistics.push({ to: target.id, dist, weight: 1 + (j % 3) * 0.35 });
+          }
+        }
+
+        for (let i = 0; i < 14; i++) {
+          const baseHub = hubs[i % hubs.length];
+          const anchorNode = nodes[(i * 347 + 19) % nodes.length];
+          baseHub.staticDefenses.push({
+            x: anchorNode.x + 12,
+            y: anchorNode.y + 8,
+            hp: 50,
+            targetLock: null,
+            ready: true
+          });
+        }
+
+        const world = {
+          nodes,
+          roads,
+          hubs,
+          validation,
+          width: 4200,
+          height: 2600,
+          payloadBytes: GEOGRAPHIC_PAYLOAD.byteLength
+        };
+
+        if (world.nodes.length !== 8000) {
+          throw new Error('node count mismatch');
+        }
+        if (world.hubs.length !== 50) {
+          throw new Error('hub count mismatch');
+        }
+        if (world.payloadBytes < 1_048_576) {
+          throw new Error('embedded payload under minimum threshold');
+        }
+
+        return world;
+      } catch (e) {
+        validation.fallbackUsed = true;
+        validation.errors.push(String(e));
+        const fallbackNodes = generateFallbackData();
+        const fallbackHubs = [];
+        for (let i = 0; i < 50; i++) {
+          const anchor = fallbackNodes[(i * 157 + 41) % fallbackNodes.length];
+          fallbackHubs.push({
+            id: `hub-${i}`,
+            index: i,
+            type: ['factory', 'depot', 'fob', 'refinery', 'airfield', 'port'][i % 6],
+            x: anchor.x + ((i % 7) - 3) * 17,
+            y: anchor.y + ((i % 9) - 4) * 18,
+            hp: 100,
+            faction: ['A', 'B', 'C', 'D'][i % 4],
+            inventory: {
+              iron: 80,
+              fuel: 70,
+              ammo: 90,
+              food: 75,
+              parts: 60,
+              supply: 110
+            },
+            production: { iron: 5, fuel: 4, ammo: 5, food: 4, parts: 3 },
+            logistics: [],
+            staticDefenses: [],
+            targetLocks: [],
+            passable: true
+          });
+        }
+
+        for (let i = 0; i < fallbackHubs.length; i++) {
+          const hub = fallbackHubs[i];
+          for (let j = 0; j < 4; j++) {
+            const target = fallbackHubs[(i + 1 + j * 7) % fallbackHubs.length];
+            const dist = Math.hypot(hub.x - target.x, hub.y - target.y);
+            hub.logistics.push({ to: target.id, dist, weight: 1 + (j % 3) * 0.35 });
+          }
+        }
+
+        const fallbackRoads = [];
+        for (let i = 0; i < fallbackNodes.length; i++) {
+          const node = fallbackNodes[i];
+          for (let j = 0; j < 5; j++) {
+            const otherIndex = (i + 1 + j * 11 + (Math.floor(node.x + node.y) % 23)) % fallbackNodes.length;
+            const other = fallbackNodes[otherIndex];
+            if (other && Math.hypot(node.x - other.x, node.y - other.y) < 200) {
+              node.roads.push(other.id);
+              other.roads.push(node.id);
+            }
+          }
+          if (node.roads.length > 0) fallbackRoads.push({ a: node.id, b: node.roads.slice(0, 4) });
+        }
+
+        return {
+          nodes: fallbackNodes,
+          roads: fallbackRoads,
+          hubs: fallbackHubs,
+          validation,
+          width: 4200,
+          height: 2600,
+          payloadBytes: GEOGRAPHIC_PAYLOAD.byteLength
+        };
+      }
+    }
+
+    function createPlayer() {
+      return {
+        x: 0,
+        y: 0,
+        vx: 0,
+        vy: 0,
+        angle: 0,
+        radius: 10,
+        maxSpeed: 220,
+        accel: 520,
+        drag: 0.82,
+        health: 100,
+        armor: { front: 58, rear: 43, side: 51 },
+        turret: { yaw: 0 },
+        vehicle: {
+          classType: 'infantry',
+          mounted: false,
+          turretYaw: 0,
+          armorFront: 58,
+          armorRear: 43,
+          armorSide: 51
+        },
+        bloom: 0.08,
+        ammo: 42,
+        fireCooldown: 0
+      };
+    }
+
+    function makeBullet(x, y, angle, source) {
+      return {
+        x,
+        y,
+        vx: Math.cos(angle) * 620,
+        vy: Math.sin(angle) * 620,
+        radius: 3,
+        life: 1.3,
+        damage: 18,
+        source
+      };
+    }
+
+    function calcArmorImpact(target, incomingAngle, amount) {
+      const rel = normalizeAngle(incomingAngle - target.angle);
+      let key = 'side';
+      if (Math.abs(rel) <= Math.PI / 3) {
+        key = 'front';
+      } else if (Math.abs(rel) >= (Math.PI * 2) / 3) {
+        key = 'rear';
+      }
+      const armor = target.armor[key] || 0;
+      const effective = Math.max(0, amount - armor * 0.38);
+      target.health -= effective;
+      return { key, effective };
+    }
+
+    function spawnImpact(x, y, color, life) {
+      state.impacts.push({ x, y, color, life });
+    }
+
+    function tacticalTick(dt) {
+      const player = state.player;
+      const moveX = (state.keys.KeyD ? 1 : 0) - (state.keys.KeyA ? 1 : 0);
+      const moveY = (state.keys.KeyS ? 1 : 0) - (state.keys.KeyW ? 1 : 0);
+
+      if (moveX || moveY) {
+        const mag = Math.hypot(moveX, moveY) || 1;
+        player.vx += (moveX / mag) * player.accel * dt;
+        player.vy += (moveY / mag) * player.accel * dt;
+      }
+
+      const speed = Math.hypot(player.vx, player.vy);
+      if (speed > player.maxSpeed) {
+        const scale = player.maxSpeed / speed;
+        player.vx *= scale;
+        player.vy *= scale;
+      }
+
+      player.vx *= Math.pow(player.drag, dt * 60);
+      player.vy *= Math.pow(player.drag, dt * 60);
+      player.x += player.vx * dt;
+      player.y += player.vy * dt;
+
+      const mx = state.mouse.x - state.width * 0.5;
+      const my = state.mouse.y - state.height * 0.5;
+      player.angle = Math.atan2(my, mx);
+      player.turret.yaw = player.angle;
+
+      player.fireCooldown -= dt;
+      if (state.mouse.down && player.fireCooldown <= 0 && player.ammo > 0) {
+        const spread = player.bloom * (0.45 + Math.random() * 0.7);
+        const shotAngle = player.angle + (Math.random() - 0.5) * spread;
+        state.bullets.push(makeBullet(player.x, player.y, shotAngle, 'player'));
+        player.ammo -= 1;
+        player.fireCooldown = 0.12;
+        player.bloom = clamp(player.bloom + 0.17, 0, 1.5);
+      } else {
+        player.bloom *= 0.97;
+      }
+
+      if (state.keys.KeyE) {
+        player.vehicle.mounted = !player.vehicle.mounted;
+        if (player.vehicle.mounted) {
+          player.vehicle.classType = 'armor';
+          player.armor.front = 76;
+          player.armor.rear = 62;
+          player.armor.side = 68;
+          player.maxSpeed = 180;
+          player.radius = 15;
+        } else {
+          player.vehicle.classType = 'infantry';
+          player.armor.front = 58;
+          player.armor.rear = 43;
+          player.armor.side = 51;
+          player.maxSpeed = 220;
+          player.radius = 10;
+        }
+        state.keys.KeyE = false;
+      }
+
+      for (let i = state.bullets.length - 1; i >= 0; i--) {
+        const b = state.bullets[i];
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        b.life -= dt;
+
+        if (b.life <= 0) {
+          state.bullets.splice(i, 1);
+          continue;
+        }
+
+        let hitHub = false;
+        for (let h = 0; h < state.world.hubs.length; h++) {
+          const hub = state.world.hubs[h];
+          const dx = b.x - hub.x;
+          const dy = b.y - hub.y;
+          if (Math.hypot(dx, dy) < 20) {
+            hub.hp = clamp(hub.hp - b.damage, 0, 200);
+            hub.inventory.ammo = clamp(hub.inventory.ammo - 4, 0, 220);
+            if (hub.inventory.ammo <= 0 || hub.inventory.supply <= 0) {
+              hub.targetLocks.length = 0;
+              for (let s = 0; s < hub.staticDefenses.length; s++) {
+                hub.staticDefenses[s].targetLock = null;
+              }
+            }
+            spawnImpact(b.x, b.y, '#ffbf66', 0.38);
+            state.bullets.splice(i, 1);
+            hitHub = true;
+            break;
+          }
+        }
+
+        if (hitHub) continue;
+
+        for (let n = 0; n < state.world.nodes.length; n++) {
+          const node = state.world.nodes[n];
+          const dx = b.x - node.x;
+          const dy = b.y - node.y;
+          if (Math.hypot(dx, dy) < 11) {
+            spawnImpact(b.x, b.y, '#9fe0ff', 0.22);
+            state.bullets.splice(i, 1);
+            break;
+          }
+        }
+      }
+
+      for (let i = state.impacts.length - 1; i >= 0; i--) {
+        state.impacts[i].life -= dt;
+        if (state.impacts[i].life <= 0) {
+          state.impacts.splice(i, 1);
+        }
+      }
+
+      state.view.x = player.x;
+      state.view.y = player.y;
+    }
+
+    function strategicTick(dt) {
+      const world = state.world;
+      for (let i = 0; i < world.hubs.length; i++) {
+        const hub = world.hubs[i];
+        const production = hub.production;
+
+        hub.inventory.iron = clamp(hub.inventory.iron + production.iron * dt * 0.75, 0, 220);
+        hub.inventory.fuel = clamp(hub.inventory.fuel + production.fuel * dt * 0.7, 0, 220);
+        hub.inventory.ammo = clamp(hub.inventory.ammo + production.ammo * dt * 0.6, 0, 220);
+        hub.inventory.food = clamp(hub.inventory.food + production.food * dt * 0.5, 0, 220);
+        hub.inventory.parts = clamp(hub.inventory.parts + production.parts * dt * 0.6, 0, 180);
+        hub.inventory.supply = clamp(hub.inventory.supply - (1.5 + (i % 3)) * dt, 0, 220);
+
+        if (hub.type === 'factory' || hub.type === 'refinery') {
+          hub.inventory.iron = clamp(hub.inventory.iron + 6 * dt, 0, 220);
+          if (hub.type === 'refinery') {
+            hub.inventory.fuel = clamp(hub.inventory.fuel + 5 * dt, 0, 220);
+            hub.inventory.iron = clamp(hub.inventory.iron - 4 * dt, 0, 220);
+          }
+        }
+
+        if (hub.inventory.supply <= 0 || hub.inventory.food <= 0 || hub.inventory.ammo <= 0) {
+          hub.hp = clamp(hub.hp - (6 * dt), 0, 200);
+          hub.targetLocks.length = 0;
+          for (let d = 0; d < hub.staticDefenses.length; d++) {
+            hub.staticDefenses[d].targetLock = null;
+          }
+        }
+
+        if (hub.hp <= 0) {
+          hub.passable = false;
+          hub.inventory.supply = 0;
+        }
+      }
+    }
+
+    function drawBackground() {
+      const g = ctx.createRadialGradient(
+        state.width * 0.5,
+        state.height * 0.5,
+        10,
+        state.width * 0.5,
+        state.height * 0.5,
+        Math.max(state.width, state.height) * 0.8
+      );
+      g.addColorStop(0, '#102a38');
+      g.addColorStop(0.5, '#081c26');
+      g.addColorStop(1, '#040a0e');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, state.width, state.height);
+    }
+
+    function drawWorld() {
+      drawBackground();
+      const world = state.world;
+
+      for (let i = 0; i < world.nodes.length; i++) {
+        const node = world.nodes[i];
+        if (!isVisibleWorld(node.x, node.y)) continue;
+        const p = worldToScreen(node.x, node.y);
+        let color = '#4d7b68';
+        switch (node.tag) {
+          case 'forest': color = '#3b8f5c'; break;
+          case 'ridge': color = '#7a6d64'; break;
+          case 'river': color = '#3a88b5'; break;
+          case 'urban': color = '#a89362'; break;
+          case 'quarry': color = '#a29479'; break;
+          case 'factoryzone': color = '#6659c6'; break;
+          case 'fortified': color = '#8d5c5b'; break;
+          case 'wetland': color = '#4d7c6c'; break;
+          default: color = '#4b726d';
+        }
+        ctx.fillStyle = color;
+        ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+      }
+
+      for (let i = 0; i < world.roads.length; i++) {
+        const road = world.roads[i];
+        const a = world.nodes[road.a];
+        if (!a) continue;
+        const pa = worldToScreen(a.x, a.y);
+        for (let j = 0; j < road.b.length; j++) {
+          const b = world.nodes[road.b[j]];
+          if (!b) continue;
+          const pb = worldToScreen(b.x, b.y);
+          ctx.beginPath();
+          ctx.moveTo(pa.x, pa.y);
+          ctx.lineTo(pb.x, pb.y);
+          ctx.strokeStyle = 'rgba(153,185,225,0.28)';
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+        }
+      }
+
+      for (let i = 0; i < world.hubs.length; i++) {
+        const hub = world.hubs[i];
+        const p = worldToScreen(hub.x, hub.y);
+        let fill = '#8cb7d7';
+        if (hub.type === 'factory') fill = '#e7c568';
+        else if (hub.type === 'depot') fill = '#88d986';
+        else if (hub.type === 'fob') fill = '#dc7c7c';
+        else if (hub.type === 'refinery') fill = '#7ba7e7';
+        else if (hub.type === 'airfield') fill = '#9b9ae7';
+        else if (hub.type === 'port') fill = '#5ec8cc';
+
+        ctx.beginPath();
+        ctx.fillStyle = fill;
+        ctx.arc(p.x, p.y, clamp(10 + hub.hp * 0.08, 8, 18), 0, Math.PI * 2);
+        ctx.fill();
+
+        if (hub.inventory && hub.inventory.supply <= 0) {
+          ctx.beginPath();
+          ctx.strokeStyle = 'rgba(255,128,128,0.9)';
+          ctx.lineWidth = 2;
+          ctx.arc(p.x, p.y, 17, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+
+      const player = state.player;
+      const pp = worldToScreen(player.x, player.y);
+      ctx.save();
+      ctx.translate(pp.x, pp.y);
+      ctx.rotate(player.angle);
+      ctx.strokeStyle = '#edf5ff';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(18, 0);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.fillStyle = '#4bc6ff';
+      ctx.arc(0, 0, player.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      for (let i = 0; i < state.bullets.length; i++) {
+        const b = state.bullets[i];
+        const p = worldToScreen(b.x, b.y);
+        ctx.beginPath();
+        ctx.fillStyle = '#ffe7a9';
+        ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      for (let i = 0; i < state.impacts.length; i++) {
+        const imp = state.impacts[i];
+        const p = worldToScreen(imp.x, imp.y);
+        ctx.beginPath();
+        ctx.fillStyle = imp.color;
+        ctx.globalAlpha = clamp(imp.life * 2.5, 0, 1);
+        ctx.arc(p.x, p.y, 8 + (1 - imp.life) * 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
+      ctx.fillStyle = '#eaf4ff';
+      ctx.font = '12px Arial';
+      ctx.fillText(`HP ${Math.round(player.health)} | Ammo ${player.ammo} | Mode ${player.vehicle.classType}`, 20, 24);
+      ctx.fillText(`Pos ${player.x.toFixed(0)}, ${player.y.toFixed(0)} | Zoom ${state.view.zoom.toFixed(2)}`, 20, 44);
+
+      if (state.commandMap) {
+        drawCommandMap();
+      }
+    }
+
+    function drawCommandMap() {
+      const world = state.world;
+      ctx.save();
+      ctx.fillStyle = 'rgba(4,10,16,0.84)';
+      ctx.fillRect(0, 0, state.width, state.height);
+
+      const pad = 50;
+      const mapScaleX = (state.width - pad * 2) / 4200;
+      const mapScaleY = (state.height - pad * 2) / 2600;
+
+      for (let i = 0; i < world.nodes.length; i++) {
+        const n = world.nodes[i];
+        const px = pad + (n.x + 2000) * mapScaleX;
+        const py = pad + (n.y + 1300) * mapScaleY;
+        if (px < 0 || py < 0 || px > state.width || py > state.height) continue;
+        ctx.fillStyle = 'rgba(146,186,230,0.35)';
+        ctx.fillRect(px, py, 2, 2);
+      }
+
+      const factionColors = { A: '#5cc1ff', B: '#79d58b', C: '#f0b35f', D: '#e77977', Neutral: '#d8dfe8' };
+      for (let i = 0; i < world.nodes.length; i++) {
+        const n = world.nodes[i];
+        if (n.faction === 'Neutral') continue;
+        const px = pad + (n.x + 2000) * mapScaleX;
+        const py = pad + (n.y + 1300) * mapScaleY;
+        ctx.fillStyle = factionColors[n.faction] || '#d8dfe8';
+        ctx.fillRect(px, py, 3, 3);
+      }
+
+      for (let i = 0; i < world.hubs.length; i++) {
+        const hub = world.hubs[i];
+        const px = pad + (hub.x + 2000) * mapScaleX;
+        const py = pad + (hub.y + 1300) * mapScaleY;
+        let fill = '#7ed7d2';
+        if (hub.type === 'factory') fill = '#f4d777';
+        else if (hub.type === 'depot') fill = '#86d87a';
+        else if (hub.type === 'fob') fill = '#ff7f7e';
+        else if (hub.type === 'refinery') fill = '#74a7ff';
+        else if (hub.type === 'airfield') fill = '#9d90ff';
+        else if (hub.type === 'port') fill = '#62d6d4';
+
+        ctx.beginPath();
+        ctx.fillStyle = fill;
+        ctx.arc(px, py, 5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+        ctx.beginPath();
+        ctx.moveTo(px, py);
+        for (let j = 0; j < hub.logistics.length; j++) {
+          const target = world.hubs.find((h) => h.id === hub.logistics[j].to);
+          if (!target) continue;
+          const tx = pad + (target.x + 2000) * mapScaleX;
+          const ty = pad + (target.y + 1300) * mapScaleY;
+          ctx.lineTo(tx, ty);
+        }
+        ctx.stroke();
+
+        if (hub.inventory.supply <= 0) {
+          ctx.fillStyle = '#ff8a80';
+          ctx.fillRect(px - 7, py - 12, 14, 5);
+        }
+      }
+
+      const player = state.player;
+      const px = pad + (player.x + 2000) * mapScaleX;
+      const py = pad + (player.y + 1300) * mapScaleY;
+      ctx.beginPath();
+      ctx.fillStyle = '#6ed0ff';
+      ctx.arc(px, py, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#dfeefb';
+      ctx.font = '14px Arial';
+      ctx.fillText('COMMAND MAP', 20, 28);
+      ctx.fillText('M toggles map', 20, 48);
+      ctx.restore();
+    }
+
+    function loop(ts) {
+      const dt = Math.min((ts - (state.lastTs || ts)) / 1000 || 0.016, 0.033);
+      state.lastTs = ts;
+
+      state.tacticalAccumulator += dt;
+      state.strategicAccumulator += dt;
+
+      while (state.tacticalAccumulator >= state.tacticalRate) {
+        tacticalTick(state.tacticalRate);
+        state.tacticalAccumulator -= state.tacticalRate;
+      }
+
+      while (state.strategicAccumulator >= state.strategicRate) {
+        strategicTick(state.strategicRate);
+        state.strategicAccumulator -= state.strategicRate;
+      }
+
+      drawWorld();
+      requestAnimationFrame(loop);
+    }
+
+    function init() {
+      resize();
+      setupInput();
+      state.world = buildWorld();
+      state.player = createPlayer();
+      state.player.x = 0;
+      state.player.y = 0;
+      state.view.x = 0;
+      state.view.y = 0;
+      requestAnimationFrame(loop);
+    }
+
+    window.addEventListener('resize', resize);
+    init();
+  })();
+  </script>
+</body>
+</html>
